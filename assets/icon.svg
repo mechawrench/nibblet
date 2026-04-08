@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- soft outer glow for the spooky eyes -->
+    <filter id="eyeGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="14" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- rounded-square background -->
+  <rect width="1024" height="1024" rx="180" ry="180" fill="#0B1E3F"/>
+
+  <!-- ghost body: dome head + wavy bottom -->
+  <path d="
+    M 256 520
+    A 256 256 0 0 1 768 520
+    L 768 820
+    L 704 760
+    L 640 820
+    L 576 760
+    L 512 820
+    L 448 760
+    L 384 820
+    L 320 760
+    L 256 820
+    Z"
+    fill="#4A90D9" stroke="#A8D0FF" stroke-width="12" stroke-linejoin="round"/>
+
+  <!-- spooky eyes: angled, glowing voids with pinprick pupils -->
+  <g filter="url(#eyeGlow)">
+    <!-- left eye, tilted inward -->
+    <path d="M 396 446 L 470 470 L 458 558 L 384 534 Z" fill="#F5FBFF"/>
+    <!-- right eye, tilted inward (mirror) -->
+    <path d="M 628 446 L 554 470 L 566 558 L 640 534 Z" fill="#F5FBFF"/>
+  </g>
+  <!-- tiny dark pupils for that 1000-yard stare -->
+  <circle cx="432" cy="498" r="6" fill="#0B1E3F"/>
+  <circle cx="592" cy="498" r="6" fill="#0B1E3F"/>
+</svg>

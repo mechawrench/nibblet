@@ -44,6 +44,9 @@ uint32_t     oneShotUntil = 0;
 uint32_t     lastShakeCheck = 0;
 float        accelBaseline = 1.0f;
 unsigned long t = 0;
+// Tracks the previous git mood across loop ticks so we can fire a one-shot
+// HEART when the user transitions from "nervous"/"panic" → "clean".
+uint8_t      lastGitMood = GIT_MOOD_NONE;
 
 // Menu
 bool    menuOpen    = false;
@@ -117,6 +120,149 @@ static void beep(uint16_t freq, uint16_t dur) {
   if (settings().sound) M5.Beep.tone(freq, dur);
 }
 
+// Multi-tone chime sequencer. Sequenced non-blocking via the loop so it
+// doesn't stall BLE/display updates while it plays. Two patterns share the
+// same machine: ascending arpeggio for prompts, descending for low battery.
+struct AlertStep { uint16_t freq; uint16_t dur; uint16_t gap; };
+
+static const AlertStep PROMPT_PATTERN[] = {
+  {1600, 110,  40},
+  {2200, 110,  40},
+  {2800, 160, 120},
+  {1600, 110,  40},
+  {2200, 110,  40},
+  {2800, 220,   0},
+};
+static const uint8_t PROMPT_PATTERN_LEN =
+    sizeof(PROMPT_PATTERN) / sizeof(PROMPT_PATTERN[0]);
+
+static const AlertStep BATTERY_PATTERN[] = {
+  {1600, 120,  60},
+  {1100, 120,  60},
+  { 700, 240, 120},
+  {1100, 120,  60},
+  { 700, 320,   0},
+};
+static const uint8_t BATTERY_PATTERN_LEN =
+    sizeof(BATTERY_PATTERN) / sizeof(BATTERY_PATTERN[0]);
+
+// Played when an in-flight prompt is canceled externally (Claude Code
+// resolved it elsewhere, hook timeout, session ended, etc). Two-note
+// "ack, dismissed" so the cancel is audible without sounding like an alert.
+static const AlertStep DISMISS_PATTERN[] = {
+  {1800,  50,  30},
+  {1200,  90,   0},
+};
+static const uint8_t DISMISS_PATTERN_LEN =
+    sizeof(DISMISS_PATTERN) / sizeof(DISMISS_PATTERN[0]);
+
+static const AlertStep* alertPattern    = nullptr;
+static uint8_t          alertPatternLen = 0;
+static uint16_t         alertStep       = 0;
+static uint16_t         alertTotalSteps = 0;
+static uint32_t         alertNextMs     = 0;
+
+static bool alertChimeIdle() { return alertStep >= alertTotalSteps; }
+
+static void startChime(const AlertStep* pattern, uint8_t patternLen, uint8_t repeats) {
+  alertPattern    = pattern;
+  alertPatternLen = patternLen;
+  alertTotalSteps = (uint16_t)patternLen * (uint16_t)repeats;
+  alertStep       = 0;
+  alertNextMs     = millis();
+}
+
+// intensity 0..2: each step adds another full pass through the pattern,
+// so repeated reminders ring longer & more insistent.
+static void startAlertChime(uint8_t intensity = 0) {
+  if (intensity > 2) intensity = 2;
+  startChime(PROMPT_PATTERN, PROMPT_PATTERN_LEN, 1 + intensity);
+}
+
+static void startBatteryChime() {
+  startChime(BATTERY_PATTERN, BATTERY_PATTERN_LEN, 2);
+}
+
+static void startDismissChime() {
+  startChime(DISMISS_PATTERN, DISMISS_PATTERN_LEN, 1);
+}
+
+// Force the sequencer back to idle. Any in-flight tone gets cut by the next
+// M5.Beep.update() since startChime/dismiss can replay over it; calling
+// M5.Beep.mute() here would race with the loop, so just mark idle and
+// the next tone() call clobbers anything still hanging.
+static void stopChime() {
+  alertStep       = alertTotalSteps;
+  alertNextMs     = 0;
+}
+
+static void updateAlertChime() {
+  if (alertChimeIdle() || !alertPattern) return;
+  uint32_t now = millis();
+  if ((int32_t)(now - alertNextMs) < 0) return;
+  const AlertStep& s = alertPattern[alertStep % alertPatternLen];
+  beep(s.freq, s.dur);
+  alertNextMs = now + s.dur + s.gap;
+  alertStep++;
+}
+
+// Prompt re-chime bookkeeping: nag the user every PROMPT_REMINDER_MS while
+// a prompt is pending, capped at PROMPT_REMINDER_MAX reminders, each one
+// louder/longer than the last.
+static const uint32_t PROMPT_REMINDER_MS  = 15000;
+static const uint8_t  PROMPT_REMINDER_MAX = 3;
+static uint8_t  promptReminderCount = 0;
+static uint32_t promptReminderNextMs = 0;
+
+// Low-battery warning: chirp + on-screen icon when AXP reports <= 15% on
+// battery power. Hysteresis so a borderline reading doesn't re-chirp every
+// poll. Suppressed entirely while on USB.
+static const uint8_t  BATT_LOW_PCT  = 15;
+static const uint8_t  BATT_OK_PCT   = 25;
+static const uint32_t BATT_POLL_MS  = 5000;
+static bool     batteryLow      = false;
+static uint32_t lastBattCheckMs = 0;
+extern bool _onUsb;   // defined below; cached by clockRefreshRtc()
+
+static int batteryPercent() {
+  int mv  = (int)(M5.Axp.GetBatVoltage() * 1000);
+  int pct = (mv - 3200) / 10;   // (v-3.2) / (4.2-3.2) * 100
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  return pct;
+}
+
+static void batteryTick() {
+  uint32_t now = millis();
+  if (now - lastBattCheckMs < BATT_POLL_MS) return;
+  lastBattCheckMs = now;
+  if (_onUsb) { batteryLow = false; return; }
+  int pct = batteryPercent();
+  if (!batteryLow && pct <= BATT_LOW_PCT) {
+    batteryLow = true;
+    wake();
+    startBatteryChime();
+    Serial.printf("battery low: %d%%\n", pct);
+  } else if (batteryLow && pct >= BATT_OK_PCT) {
+    batteryLow = false;
+  }
+}
+
+// Tiny battery icon overlay drawn on top of whatever else is on screen.
+// Flashes ~1Hz so it actually catches the eye.
+static void drawBatteryWarning() {
+  if (!batteryLow) return;
+  if ((millis() / 500) & 1) return;
+  const int x = W - 18, y = 3;
+  spr.fillRect(x, y, 14, 7, HOT);
+  spr.fillRect(x + 14, y + 2, 2, 3, HOT);
+  spr.drawRect(x, y, 14, 7, WHITE);
+  spr.setTextColor(WHITE, HOT);
+  spr.setTextSize(1);
+  spr.setCursor(x + 4, y);
+  spr.print("!");
+}
+
 static void sendCmd(const char* json) {
   Serial.println(json);
   size_t n = strlen(json);
@@ -144,8 +290,8 @@ const uint8_t MENU_N = 6;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
-const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
-const uint8_t SETTINGS_N = 10;
+const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "clock rot", "clock face", "ascii pet", "reset", "back" };
+const uint8_t SETTINGS_N = 11;
 
 bool    resetOpen = false;
 uint8_t resetSel  = 0;
@@ -173,9 +319,10 @@ static void applySetting(uint8_t idx) {
     case 4: s.led = !s.led; break;
     case 5: s.hud = !s.hud; break;
     case 6: s.clockRot = (s.clockRot + 1) % 3; break;
-    case 7: nextPet(); return;
-    case 8: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-    case 9: settingsOpen = false; characterInvalidate(); return;
+    case 7: s.clockMode = (s.clockMode + 1) % 2; characterInvalidate(); break;
+    case 8: nextPet(); return;
+    case 9: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+    case 10: settingsOpen = false; characterInvalidate(); return;
   }
   settingsSave();
 }
@@ -278,6 +425,9 @@ static void drawSettings() {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
     } else if (i == 7) {
+      static const char* const CM[] = { "time", "idle" };
+      spr.print(CM[s.clockMode]);
+    } else if (i == 8) {
       uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
       uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
       spr.printf("%u/%u", pos, total);
@@ -356,7 +506,7 @@ static uint8_t paintedOrient = 0;
 static RTC_TimeTypeDef _clkTm;
 static RTC_DateTypeDef _clkDt;
 uint32_t               _clkLastRead = 0;   // zeroed by data.h on time-sync
-static bool            _onUsb       = false;
+bool                   _onUsb       = false;   // forward-declared above
 static void clockRefreshRtc() {
   if (millis() - _clkLastRead < 1000) return;
   _clkLastRead = millis();
@@ -413,12 +563,127 @@ static const char* const MON[] = {
 static const char* const DOW[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 
 static uint8_t clockDow() { return _clkDt.WeekDay % 7; }
+// Idle-mode display: show how long since Claude Code last touched a
+// transcript, in HH:MM big + :SS small (matching the clock layout). The
+// firmware extrapolates from the last bridge value forward by millis()
+// elapsed since, so the seconds tick smoothly between snapshots.
+//
+// Caps at 99:59:59 — Claude idle for 4+ days is "very idle, exact value
+// doesn't matter". When the bridge hasn't sent us idle data yet, returns
+// dashes so the layout doesn't jump.
+static uint32_t currentIdleSecs() {
+  if (!tama.idleValid) return 0;
+  uint32_t elapsed = (millis() - tama.idleUpdatedMs) / 1000;
+  return tama.idleSecs + elapsed;
+}
+
+static void formatIdleClock(char* big, size_t nBig, char* small, size_t nSmall) {
+  if (!tama.idleValid) {
+    snprintf(big,   nBig,   "--:--");
+    snprintf(small, nSmall, ":--");
+    return;
+  }
+  uint32_t total = currentIdleSecs();
+  if (total > 99UL*3600 + 59UL*60 + 59) total = 99UL*3600 + 59UL*60 + 59;
+  uint32_t h = total / 3600;
+  uint32_t m = (total / 60) % 60;
+  uint32_t s = total % 60;
+  snprintf(big,   nBig,   "%02lu:%02lu", (unsigned long)h, (unsigned long)m);
+  snprintf(small, nSmall, ":%02lu", (unsigned long)s);
+}
+
+// Build the dollar label drawn over the progress bar ("$25.78 / $50")
+// and the reset countdown line beneath it. Both empty when the bridge
+// hasn't sent usage yet.
+static void formatUsageLines(char* label, size_t nLabel, char* resets, size_t nResets) {
+  label[0]  = 0;
+  resets[0] = 0;
+  if (!tama.usageValid) return;
+  uint32_t cents = tama.usageCents;
+  uint32_t cap   = tama.usageCapCents > 0 ? tama.usageCapCents : 5000;
+  // "$25.78 / $50"
+  snprintf(label, nLabel, "$%lu.%02lu/$%lu",
+           (unsigned long)(cents / 100),
+           (unsigned long)(cents % 100),
+           (unsigned long)(cap / 100));
+  uint32_t r = tama.usageResetsInSecs;
+  if (r == 0 && cents == 0) {
+    snprintf(resets, nResets, "5h rolling");
+  } else if (r >= 3600) {
+    snprintf(resets, nResets, "resets %luh%02lum",
+             (unsigned long)(r / 3600), (unsigned long)((r % 3600) / 60));
+  } else if (r >= 60) {
+    snprintf(resets, nResets, "resets %lum", (unsigned long)(r / 60));
+  } else if (r > 0) {
+    snprintf(resets, nResets, "resets %lus", (unsigned long)r);
+  } else {
+    snprintf(resets, nResets, "5h rolling");
+  }
+}
+
+// Color ramp for the progress bar fill: green up to 80% of cap, amber to
+// 100%, red over. Same scheme used by most "remaining quota" UIs.
+static uint16_t usageBarColor(uint32_t cents, uint32_t cap) {
+  if (cap == 0) return 0x07E0;            // green
+  uint32_t pct = (cents * 100) / cap;
+  if (pct < 80)  return 0x07E0;           // GREEN
+  if (pct < 100) return 0xFD20;           // amber
+  return HOT;                              // red-orange / over budget
+}
+
+// Draw a horizontal progress bar with the dollar label centered on top.
+// `target` is either the offscreen sprite (portrait) or M5.Lcd (landscape).
+// Bar fill clamps to bar width when over-cap. Label uses transparent text
+// so it shows over both filled and empty halves cleanly.
+template <typename Target>
+static void drawUsageBar(Target* tgt, int x, int y, int w, int h,
+                         const char* label, const Palette& p) {
+  if (!tama.usageValid) return;
+  uint32_t cents = tama.usageCents;
+  uint32_t cap   = tama.usageCapCents > 0 ? tama.usageCapCents : 5000;
+
+  tgt->fillRect(x, y, w, h, p.bg);
+  tgt->drawRect(x, y, w, h, p.textDim);
+
+  uint32_t fillW = (cents >= cap) ? (uint32_t)(w - 2)
+                                  : ((uint64_t)(w - 2) * cents) / cap;
+  if ((int)fillW > w - 2) fillW = w - 2;
+  if (fillW > 0) {
+    tgt->fillRect(x + 1, y + 1, (int)fillW, h - 2, usageBarColor(cents, cap));
+  }
+
+  // Centered label, transparent foreground so the fill colors show through
+  // behind the unlit pixels.
+  tgt->setTextSize(1);
+  tgt->setTextDatum(MC_DATUM);
+  tgt->setTextColor(WHITE);   // single-arg = transparent bg
+  tgt->drawString(label, x + w / 2, y + h / 2);
+  tgt->setTextColor(p.text, p.bg);   // restore opaque mode for callers
+}
+
 static void drawClock() {
   const Palette& p = characterPalette();
-  char hm[6]; snprintf(hm, sizeof(hm), "%02u:%02u", _clkTm.Hours, _clkTm.Minutes);
-  char ss[4]; snprintf(ss, sizeof(ss), ":%02u", _clkTm.Seconds);
+  bool idleMode = settings().clockMode == 1;
   uint8_t mi = (_clkDt.Month >= 1 && _clkDt.Month <= 12) ? _clkDt.Month - 1 : 0;
-  char dl[8]; snprintf(dl, sizeof(dl), "%s %02u", MON[mi], _clkDt.Date);
+  // Two seconds variants because portrait wants ":SS" and landscape time
+  // wants bare "SS". In idle mode both get ":SS" since the layout is the
+  // same either way.
+  char hm[6], ss[6], ssl[6];
+  char dl[16], wdl[16];
+  if (idleMode) {
+    formatIdleClock(hm, sizeof(hm), ss, sizeof(ss));
+    snprintf(ssl, sizeof(ssl), "%s", ss);
+    snprintf(dl,  sizeof(dl),  "since claude");
+    snprintf(wdl, sizeof(wdl), "since claude");
+  } else {
+    snprintf(hm,  sizeof(hm),  "%02u:%02u", _clkTm.Hours, _clkTm.Minutes);
+    snprintf(ss,  sizeof(ss),  ":%02u", _clkTm.Seconds);
+    snprintf(ssl, sizeof(ssl), "%02u", _clkTm.Seconds);
+    snprintf(dl,  sizeof(dl),  "%s %02u", MON[mi], _clkDt.Date);
+    snprintf(wdl, sizeof(wdl), "%s %s %02u", DOW[clockDow()], MON[mi], _clkDt.Date);
+  }
+  char usage1[20], usage2[20];
+  formatUsageLines(usage1, sizeof(usage1), usage2, sizeof(usage2));
 
   if (clockOrient == 0) {
     paintedOrient = 0;
@@ -428,7 +693,15 @@ static void drawClock() {
     spr.setTextDatum(MC_DATUM);
     spr.setTextSize(4); spr.setTextColor(p.text, p.bg);    spr.drawString(hm, CX, 140);
     spr.setTextSize(2); spr.setTextColor(p.textDim, p.bg); spr.drawString(ss, CX, 175);
-    spr.setTextSize(1);                                     spr.drawString(dl, CX, 200);
+    spr.setTextSize(1);                                     spr.drawString(dl, CX, 196);
+    if (usage1[0]) {
+      // Real progress bar with the dollar label centered on top, then
+      // the reset countdown beneath.
+      drawUsageBar(&spr, 6, 207, W - 12, 13, usage1, p);
+      spr.setTextDatum(MC_DATUM);
+      spr.setTextColor(p.textDim, p.bg);
+      spr.drawString(usage2, CX, 230);
+    }
     spr.setTextDatum(TL_DATUM);
     return;
   }
@@ -437,20 +710,38 @@ static void drawClock() {
   // text glyph bg cells repaint themselves and the pet box (small, ~90×50)
   // gets a fillRect each pet tick — small enough not to tear.
   M5.Lcd.setRotation(clockOrient);
-  static uint8_t lastSec = 0xFF;
+  static uint8_t lastSec  = 0xFF;
+  static uint8_t lastMode = 0xFF;
   bool repaint = paintedOrient != clockOrient;
   if (repaint) { M5.Lcd.fillScreen(p.bg); paintedOrient = clockOrient; lastSec = 0xFF; }
+  // Time ↔ idle swap changes label widths ("Mon Apr 08" vs "since claude").
+  // Wipe the right text column so the wider previous string doesn't leave
+  // stale glyphs around the shorter new one.
+  if (lastMode != (uint8_t)idleMode) {
+    M5.Lcd.fillRect(115, 0, 240 - 115, 135, p.bg);
+    lastMode = (uint8_t)idleMode;
+    lastSec  = 0xFF;
+  }
 
   // Seconds tick at 1Hz; redrawing 3 strings at 60fps is 180 SPI ops/sec
-  // for nothing. Gate on the second changing (or full repaint).
+  // for nothing. Gate on the wall-clock second changing (or full repaint)
+  // — that's also 1Hz which is fast enough for the idle counter to look
+  // smooth to the second.
   if (repaint || _clkTm.Seconds != lastSec) {
     lastSec = _clkTm.Seconds;
-    char wdl[12]; snprintf(wdl, sizeof(wdl), "%s %s %02u", DOW[clockDow()], MON[mi], _clkDt.Date);
-    char ssl[3]; snprintf(ssl, sizeof(ssl), "%02u", _clkTm.Seconds);
     M5.Lcd.setTextDatum(MC_DATUM);
-    M5.Lcd.setTextSize(3); M5.Lcd.setTextColor(p.text, p.bg);    M5.Lcd.drawString(hm, 170, 42);
-    M5.Lcd.setTextSize(2); M5.Lcd.setTextColor(p.textDim, p.bg); M5.Lcd.drawString(ssl, 170, 72);
-                                                                  M5.Lcd.drawString(wdl, 170, 102);
+    M5.Lcd.setTextSize(3); M5.Lcd.setTextColor(p.text, p.bg);    M5.Lcd.drawString(hm, 170, 38);
+    M5.Lcd.setTextSize(2); M5.Lcd.setTextColor(p.textDim, p.bg); M5.Lcd.drawString(ssl, 170, 66);
+                                                                  M5.Lcd.drawString(wdl, 170, 92);
+    M5.Lcd.setTextSize(1);
+    if (usage1[0]) {
+      // Bar in the right column under the weekday line. Width is the
+      // right column minus margins; matches the portrait look.
+      drawUsageBar(&M5.Lcd, 120, 105, 115, 13, usage1, p);
+      M5.Lcd.setTextDatum(MC_DATUM);
+      M5.Lcd.setTextColor(p.textDim, p.bg);
+      M5.Lcd.drawString(usage2, 177, 126);
+    }
     M5.Lcd.setTextDatum(TL_DATUM);
     M5.Lcd.setTextSize(1);
   }
@@ -481,11 +772,18 @@ static void drawClock() {
 }
 
 PersonaState derive(const TamaState& s) {
+  // Claude state always wins — an approval prompt or active session is
+  // strictly more urgent than git status. Git mood only colors the
+  // otherwise-idle state, so the pet can quietly indicate "you've been
+  // sitting on a dirty tree for an hour" without stomping on real work.
   if (!s.connected)            return P_IDLE;
   if (s.sessionsWaiting > 0)   return P_ATTENTION;
   if (s.recentlyCompleted)     return P_CELEBRATE;
   if (s.sessionsRunning >= 3)  return P_BUSY;
-  return P_IDLE;   // connected, 0+ sessions, nothing urgent — hang out
+  // Idle and connected — let git mood drive the visual.
+  if (s.gitMood == GIT_MOOD_PANIC)   return P_DIZZY;
+  if (s.gitMood == GIT_MOOD_NERVOUS) return P_DIZZY;
+  return P_IDLE;   // clean, none, or feature off — hang out
 }
 
 void triggerOneShot(PersonaState s, uint32_t durMs) {
@@ -978,11 +1276,22 @@ void setup() {
 void loop() {
   M5.update();
   M5.Beep.update();
+  updateAlertChime();
+  batteryTick();
   t++;
   uint32_t now = millis();
 
   dataPoll(&tama);
   if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 3000);
+  // Git mood transition: NERVOUS or PANIC → CLEAN means the user just
+  // committed / resolved conflicts. Beam at them with a one-shot heart.
+  // Skip the very first transition from NONE so the pet doesn't pop a
+  // heart just because the bridge connected for the first time.
+  if (tama.gitMood == GIT_MOOD_CLEAN &&
+      (lastGitMood == GIT_MOOD_NERVOUS || lastGitMood == GIT_MOOD_PANIC)) {
+    triggerOneShot(P_HEART, 3000);
+  }
+  lastGitMood = tama.gitMood;
   baseState = derive(tama);
 
   // After waking the screen, hold sleep for 12s so users see the wake-up
@@ -1009,15 +1318,24 @@ void loop() {
   }
 
   // BtnA: step through fake scenarios
-  // Prompt arrival: beep, reset response flag
+  // Prompt arrival or external cancel: beep, reset response flag.
+  // External cancel = the bridge cleared the prompt without a stick action
+  // (Claude Code resolved it locally, hook timed out, session ended, etc).
+  // Detect that case via `responseSent` — if the user already pressed A/B
+  // their approval chirp already played, no need to "dismiss" again.
   if (strcmp(tama.promptId, lastPromptId) != 0) {
+    bool hadPrompt      = lastPromptId[0] != 0;
+    bool externalCancel = hadPrompt && !tama.promptId[0] && !responseSent;
+
     strncpy(lastPromptId, tama.promptId, sizeof(lastPromptId)-1);
     lastPromptId[sizeof(lastPromptId)-1] = 0;
     responseSent = false;
     if (tama.promptId[0]) {
-      promptArrivedMs = millis();
+      promptArrivedMs       = millis();
+      promptReminderCount   = 0;
+      promptReminderNextMs  = promptArrivedMs + PROMPT_REMINDER_MS;
       wake();
-      beep(1200, 80);   // alert chirp
+      startAlertChime();   // multi-tone alert: prompt waiting
       // Jump to the approval screen no matter what was open — drawApproval
       // only runs from drawHUD which only runs in DISP_NORMAL.
       displayMode = DISP_NORMAL;
@@ -1025,10 +1343,37 @@ void loop() {
       applyDisplayMode();
       characterInvalidate();
       if (buddyMode) buddyInvalidate();
+    } else {
+      promptReminderCount  = 0;
+      promptReminderNextMs = 0;
+      if (externalCancel) {
+        stopChime();
+        startDismissChime();
+        characterInvalidate();
+        if (buddyMode) buddyInvalidate();
+        Serial.println("prompt: canceled externally");
+      }
     }
   }
 
   bool inPrompt = tama.promptId[0] && !responseSent;
+
+  // Escalating re-chime: nag the user every PROMPT_REMINDER_MS while a
+  // prompt is pending. Each reminder uses a higher intensity so it's longer
+  // and more insistent. Capped at PROMPT_REMINDER_MAX so we don't loop
+  // forever on a forgotten device.
+  if (inPrompt && promptReminderCount < PROMPT_REMINDER_MAX
+      && (int32_t)(now - promptReminderNextMs) >= 0
+      && alertChimeIdle()) {
+    promptReminderCount++;
+    startAlertChime(promptReminderCount);
+    promptReminderNextMs = now + PROMPT_REMINDER_MS;
+    wake();
+  }
+  if (!inPrompt && promptReminderCount > 0) {
+    promptReminderCount  = 0;
+    promptReminderNextMs = 0;
+  }
 
   // Button-press wake. Track which button woke the screen so its full
   // press cycle (including long-press) is swallowed — you don't want
@@ -1071,6 +1416,10 @@ void loop() {
         snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
         sendCmd(cmd);
         responseSent = true;
+        // Cut any in-flight alert/reminder tones immediately. Without
+        // this the chime keeps ticking through PROMPT_PATTERN until it
+        // ends naturally and the approval feels laggy.
+        stopChime();
         uint32_t tookS = (millis() - promptArrivedMs) / 1000;
         statsOnApproval(tookS);
         beep(2400, 60);
@@ -1104,6 +1453,9 @@ void loop() {
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
       sendCmd(cmd);
       responseSent = true;
+      // Cut any in-flight alert/reminder tones immediately — same
+      // reasoning as the approve handler above.
+      stopChime();
       statsOnDenial();
       beep(600, 60);
     } else if (resetOpen) {
@@ -1137,10 +1489,14 @@ void loop() {
   clockRefreshRtc();   // 1Hz internal throttle; also caches _onUsb
   // Show the clock when nothing is happening — bridge heartbeat alone
   // doesn't count as activity (it's the only way to get the RTC synced).
+  // Idle mode (clockMode == 1) is also allowed on battery: it counts
+  // time-since-claude from the bridge, so it doesn't need the RTC and is
+  // useful to glance at unplugged. Time mode still requires USB + RTC.
+  bool idleClockMode = settings().clockMode == 1;
   bool clocking = displayMode == DISP_NORMAL
                && !menuOpen && !settingsOpen && !resetOpen && !inPrompt
                && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
-               && dataRtcValid() && _onUsb;
+               && (idleClockMode || (dataRtcValid() && _onUsb));
   if (clocking) clockUpdateOrient();
   else { clockOrient = 0; orientFrames = 0; paintedOrient = 0; }
   bool landscapeClock = clocking && clockOrient != 0;
@@ -1210,6 +1566,7 @@ void loop() {
     if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
     else if (menuOpen) drawMenu();
+    drawBatteryWarning();
     spr.pushSprite(0, 0);
   }
 

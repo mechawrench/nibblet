@@ -2,3 +2,11 @@
 .vscode/
 .DS_Store
 data/
+.nibblet/
+.claude/
+.venv/
+.eggs/
+build/
+dist/
+__pycache__/
+*.pyc

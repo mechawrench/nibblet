@@ -19,6 +19,37 @@ struct TamaState {
   char     promptId[40];     // pending permission request ID; empty = no prompt
   char     promptTool[20];
   char     promptHint[44];
+  // Real Claude Code rolling-window usage from the bridge. The bridge
+  // computes these from local transcript JSONLs and refreshes ~30s.
+  // usageValid stays false until the first usage payload arrives.
+  bool     usageValid;
+  uint32_t usageCents;          // total API-list-price cents in window
+  uint32_t usageCapCents;       // visual progress bar cap (manual budget)
+  uint32_t usageResetsInSecs;   // seconds until oldest message ages out
+  uint32_t usageWindowSecs;     // window length (5h = 18000)
+  uint32_t usageUpdatedMs;      // millis() of last usage update
+  // Idle timer: seconds since Claude Code last touched a transcript file.
+  // The bridge computes this on every snapshot. The firmware extrapolates
+  // forward from `idleUpdatedMs` between snapshots so the display is
+  // smooth to the second.
+  bool     idleValid;
+  uint32_t idleSecs;            // value from last bridge snapshot
+  uint32_t idleUpdatedMs;       // millis() when we received it
+  // Git mood from the bridge. 0 = unknown / feature off, otherwise one
+  // of GIT_MOOD_CLEAN/NERVOUS/PANIC. The bridge only emits this when
+  // NIBBLET_GIT_REPOS is configured, so 0 is the default for users who
+  // don't opt in.
+  uint8_t  gitMood;
+  uint32_t gitDirtySecs;
+  uint16_t gitConflicts;
+  char     gitRepo[18];
+};
+
+enum : uint8_t {
+  GIT_MOOD_NONE    = 0,
+  GIT_MOOD_CLEAN   = 1,
+  GIT_MOOD_NERVOUS = 2,
+  GIT_MOOD_PANIC   = 3,
 };
 
 // BLE transport replaces the old BT Classic SerialBT. See ble_bridge.h.
@@ -114,6 +145,47 @@ static void _applyJson(const char* line, TamaState* out) {
     }
     out->nLines = n;
   }
+  JsonObject usg = doc["usage"];
+  if (!usg.isNull()) {
+    out->usageCents        = usg["cents"]  | out->usageCents;
+    out->usageCapCents     = usg["cap"]    | out->usageCapCents;
+    out->usageResetsInSecs = usg["resets"] | out->usageResetsInSecs;
+    out->usageWindowSecs   = usg["window"] | out->usageWindowSecs;
+    out->usageUpdatedMs    = millis();
+    out->usageValid        = true;
+  }
+
+  if (doc["idle_secs"].is<int32_t>()) {
+    int32_t idle = doc["idle_secs"].as<int32_t>();
+    if (idle >= 0) {
+      out->idleSecs      = (uint32_t)idle;
+      out->idleUpdatedMs = millis();
+      out->idleValid     = true;
+    } else {
+      out->idleValid     = false;   // bridge says no transcripts ever
+    }
+  }
+
+  // Git mood (optional). When NIBBLET_GIT_REPOS is unset on the bridge
+  // host, this object is still emitted but with mood=null — parsed as
+  // GIT_MOOD_NONE here so the firmware behaves as if the feature is off.
+  JsonObject git = doc["git"];
+  if (!git.isNull()) {
+    const char* m = git["mood"];
+    uint8_t mood = GIT_MOOD_NONE;
+    if (m) {
+      if      (!strcmp(m, "clean"))   mood = GIT_MOOD_CLEAN;
+      else if (!strcmp(m, "nervous")) mood = GIT_MOOD_NERVOUS;
+      else if (!strcmp(m, "panic"))   mood = GIT_MOOD_PANIC;
+    }
+    out->gitMood      = mood;
+    out->gitDirtySecs = git["dirty_secs"] | 0;
+    out->gitConflicts = git["conflicts"]  | 0;
+    const char* gr = git["repo"];
+    strncpy(out->gitRepo, gr ? gr : "", sizeof(out->gitRepo) - 1);
+    out->gitRepo[sizeof(out->gitRepo) - 1] = 0;
+  }
+
   JsonObject pr = doc["prompt"];
   if (!pr.isNull()) {
     const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
