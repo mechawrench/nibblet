@@ -19,3 +19,15 @@ bool bleConnected();
 size_t bleAvailable();
 int bleRead();
 size_t bleWrite(const uint8_t* data, size_t len);
+
+// 6-digit pairing passkey generated fresh at boot. The device is in
+// DisplayOnly mode, so the host (macOS) prompts the user to type this
+// number into its pairing dialog. UI code uses this to show the PIN
+// on-screen until the device has been bonded.
+uint32_t blePairingPasskey();
+
+// True iff at least one bonded device exists in the ESP NVS bond store.
+// Cheap call — reads a counter from the BT controller. The on-screen
+// pairing overlay polls this every frame and hides itself once a bond
+// shows up (i.e., the very first successful pair).
+bool     bleHasBonds();

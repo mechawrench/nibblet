@@ -51,7 +51,7 @@ This is a fork of [felixrieseberg/nibblet](https://github.com/felixrieseberg/nib
 - **Two-note "ack" chime** when a remote allow/deny lands — audible feedback that the decision actually reached the stick from across the room.
 
 ### Hardened BLE pairing
-- **Secure Connections + MITM passkey pairing.** At boot the stick prints a fresh random 6-digit passkey on its USB serial console; macOS prompts for it on first pair, then bonds silently after that. All NUS reads/writes/notifies are AES-CCM encrypted, GATT characteristics carry `ESP_GATT_PERM_*_ENCRYPTED`, and the LE Secure Connections ECDH (P-256) handshake means a passive sniffer can't crack the key the way `crackle` could break legacy pairing. Upstream README documented "no manual pairing button"; this fork replaces that with explicit MITM-resistant pairing. Caveats and remaining gaps documented in [BLE security](#ble-security).
+- **Secure Connections + MITM passkey pairing.** At boot the stick generates a fresh random 6-digit passkey and shows it **right on the device screen** in a "pair me" overlay whenever no bond exists yet. macOS prompts for the same passkey on first pair, then bonds silently. The overlay disappears forever after the first successful pair. (Same passkey is also printed to USB serial as a fallback.) All NUS reads/writes/notifies are AES-CCM encrypted, GATT characteristics carry `ESP_GATT_PERM_*_ENCRYPTED`, and the LE Secure Connections ECDH (P-256) handshake means a passive sniffer can't crack the key the way `crackle` could break legacy pairing. Upstream README documented "no manual pairing button"; this fork replaces that with explicit MITM-resistant pairing. Caveats and remaining gaps documented in [BLE security](#ble-security).
 
 ### BLE protocol additions
 On top of the upstream snapshot fields (`total / running / waiting / connected / msg / tokens / lines / prompt`):
@@ -154,12 +154,14 @@ The desktop integration lives in the Claude desktop app under **Prototypes → N
 
 ### First-time pairing
 
-The stick uses **Secure Connections + MITM passkey pairing**. At boot it prints a fresh 6-digit passkey on its USB serial console (visible with `pio device monitor` or any serial terminal). On the very first connect, macOS pops up a dialog asking for that passkey — type it in.
+The stick uses **Secure Connections + MITM passkey pairing**. At boot it generates a fresh random 6-digit passkey. As long as the device has zero bonds in NVS (i.e., it's never been paired, or you just ran `pio run -t erase` / factory reset), the passkey is shown **on the device screen** in a centered "pair me" overlay — so you don't need a USB cable or serial terminal to see it. On the very first connect, macOS pops up a dialog asking for that passkey; type in the number on the screen.
+
+As soon as the bond completes, the on-screen overlay disappears forever (until you wipe bonds again). The same passkey is also printed to the USB serial console (`pio device monitor`) as a fallback if you happen to be tethered.
 
 The bond is then stored on both sides; every subsequent reconnect is silent.
 
 > [!IMPORTANT]
-> To re-pair (after a "Forget" on macOS or a `pio run -t erase` on the stick), reboot the stick to surface a fresh passkey, then reconnect.
+> To re-pair (after a "Forget" on macOS or a `pio run -t erase` on the stick), reboot the stick to surface a fresh passkey, then reconnect. After erase, the on-screen overlay reappears immediately on the next boot.
 
 macOS will also prompt for Bluetooth permission the first time the desktop app runs — grant it.
 

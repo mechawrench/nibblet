@@ -190,6 +190,16 @@ void bleInit(const char* deviceName) {
 
 bool bleConnected() { return connected; }
 
+uint32_t blePairingPasskey() { return pairingPasskey; }
+
+// Counts bonds known to the ESP BT controller. After a successful pair,
+// `esp_ble_get_bond_device_num()` returns >= 1 even across reboots, since
+// the bond store lives in NVS. UI code uses this to hide the pairing
+// overlay once the first pair lands.
+bool bleHasBonds() {
+  return esp_ble_get_bond_device_num() > 0;
+}
+
 size_t bleAvailable() {
   return (rxHead + RX_CAP - rxTail) % RX_CAP;
 }

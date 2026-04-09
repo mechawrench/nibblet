@@ -248,6 +248,46 @@ static void batteryTick() {
   }
 }
 
+// First-time pairing overlay: shows the 6-digit BLE passkey on screen
+// so the user can pair without having to look at the USB serial console.
+// Auto-hides forever once at least one bond exists in NVS (i.e., right
+// after the very first successful pair). The caller is responsible for
+// suppressing this when a menu/settings/reset overlay is up.
+//
+// Safe to call every frame: bleHasBonds() reads a cached counter from
+// the BT controller, no NVS scan.
+static void drawPairingOverlay() {
+  if (bleHasBonds()) return;
+
+  uint32_t pk = blePairingPasskey();
+  const Palette& p = characterPalette();
+
+  int mw = 122, mh = 84;
+  int mx = (W - mw) / 2;
+  int my = (H - mh) / 2;
+  spr.fillRoundRect(mx, my, mw, mh, 6, PANEL);
+  spr.drawRoundRect(mx, my, mw, mh, 6, p.text);
+
+  spr.setTextDatum(MC_DATUM);
+
+  spr.setTextSize(1);
+  spr.setTextColor(p.textDim, PANEL);
+  spr.drawString("pair me", CX, my + 10);
+
+  char pin[8];
+  snprintf(pin, sizeof(pin), "%06u", (unsigned)pk);
+  spr.setTextSize(3);
+  spr.setTextColor(p.text, PANEL);
+  spr.drawString(pin, CX, my + 34);
+
+  spr.setTextSize(1);
+  spr.setTextColor(p.textDim, PANEL);
+  spr.drawString("enter on mac", CX, my + 60);
+  spr.drawString("when prompted", CX, my + 70);
+
+  spr.setTextDatum(TL_DATUM);
+}
+
 // Tiny battery icon overlay drawn on top of whatever else is on screen.
 // Flashes ~1Hz so it actually catches the eye.
 static void drawBatteryWarning() {
@@ -1566,6 +1606,7 @@ void loop() {
     if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
     else if (menuOpen) drawMenu();
+    else drawPairingOverlay();   // suppressed while a menu is open
     drawBatteryWarning();
     spr.pushSprite(0, 0);
   }
